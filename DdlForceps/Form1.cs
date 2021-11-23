@@ -11,13 +11,24 @@ using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 using Dapper;
+using Dapper.Oracle;
 using LibGit2Sharp;
 using Oracle.ManagedDataAccess.Client;
+using Oracle.ManagedDataAccess.Types;
 
 namespace DdlForceps
 {
     public partial class Form1 : Form
     {
+        // TODO: рефакторинг
+        // TODO: конфиг
+        // TODO: асинхронная загруза
+        // TODO: список фиксов
+        // TODO: список файлов в фиксах и их сравнение
+        // TODO: добавление тэгов
+        // TODO: выбор файлов для сборки. создание ветки, сборка старой версии, фикс, сборка новой версии, фикс
+        // TODO: пуш и мерж
+        
         private static readonly Regex invalidPathRegex = new Regex($"[{new string(Path.GetInvalidPathChars())}]", RegexOptions.Compiled);
         private static readonly Regex invalidFileNameRegex = new Regex($"[{new string(Path.GetInvalidFileNameChars())}]", RegexOptions.Compiled);
 
@@ -32,25 +43,45 @@ namespace DdlForceps
             "FUNCTION",
             "PROCEDURE",
             "PACKAGE",
-            "PACKAGE BODY",
+            "PACKAGE_BODY",
             "TYPE",
-            "TYPE BODY"
+            "TYPE_BODY"
         };
 
-        private static readonly string getObjectsSql = "select O.owner, O.object_name as name, O.object_type as type from all_objects O where O.generated = 'N' AND O.secondary = 'N' AND O.oracle_maintained = 'N'";
+        private static readonly HashSet<string> schemas = new HashSet<string> {
+        };
+
+        private static readonly string getObjectsSql = @$"
+SELECT
+    O.owner,
+    O.object_name as name,
+    replace(O.object_type, ' ', '_') as type
+FROM all_objects O
+WHERE O.generated = 'N'
+  AND O.secondary = 'N'
+  AND O.oracle_maintained = 'N'
+  AND O.owner IN ('{string.Join("','", Form1.schemas)}')
+  AND last_ddl_time > :last
+ORDER BY last_ddl_time DESC";
 
         private static readonly string getDdlSql =
 @"
+declare
+    ddl_code clob;
+begin
+    ddl_code := to_clob(trim(trim(chr(10) from DBMS_METADATA.GET_DDL(:type, :name, :owner))));
+    :ddl_code := ddl_code;
+end;
+";
+/*
 begin
 :ddl_code := trim(trim(chr(10) from DBMS_METADATA.GET_DDL(:type, :name, :owner)));
 end;
-";
-
-        private static readonly string connectionString = "Data Source=localhost:1521/XEPDB1;User Id=mt;Password=mt;";
-
-        private static readonly string folder = @"C:\Users\user\Documents\db\_DBS";
+*/
 
         private static readonly string RFC2822Format = "ddd dd MMM HH:mm:ss yyyy K";
+
+        private static readonly string dateFormat = "yyyy-MM-ddTHH:mm:ss";
 
         public Form1()
         {
@@ -70,11 +101,12 @@ end;
         {
         }
 
-        public void LoadDdl()
+        public void LoadDdl(DateTime last)
         {
             using (OracleConnection cn = new OracleConnection(Form1.connectionString))
             {
-                var objects = this.GetObjects(cn);
+                cn.Open();
+                var objects = this.GetObjects(cn, last);
 
                 foreach (var obj in objects)
                 {
@@ -88,14 +120,30 @@ end;
                         // object not found
                         catch (OracleException ex) when (ex.Number == 31603)
                         {
-                            // skip
                             this.AppendLine($"{obj.Type} {obj.Owner}.{obj.Name} не найден");
                         }
                     }
                 }
             }
 
-            this.Commit(folder, DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss"));
+            this.Commit(folder, DateTime.Now.ToString(Form1.dateFormat));
+        }
+
+        public DateTime GetLastAutocommitDate()
+        {
+            using (var repo = new Repository(folder))
+            {
+                foreach (Commit c in repo.Commits.Take(15))
+                {
+                    DateTime dt;
+                    if (DateTime.TryParseExact(c.Message?.Substring(0, Form1.dateFormat.Length), Form1.dateFormat, null, DateTimeStyles.None, out dt))
+                    {
+                        return dt;
+                    }
+                }
+            }
+
+            return new DateTime(2000, 1, 1);
         }
 
         public void ShowChangeLog()
@@ -169,6 +217,11 @@ end;
 
         private void Save(ServerObject obj, string ddl)
         {
+            if (ddl is null)
+            {
+                return;
+            }
+
             string path = Path.Combine(Form1.folder, Form1.invalidPathRegex.Replace(obj.Owner, "_"), Form1.invalidPathRegex.Replace(obj.Type, "_"));
             Directory.CreateDirectory(path);
 
@@ -177,20 +230,21 @@ end;
             File.WriteAllText(fileName, ddl, Encoding.UTF8);
         }
 
-        private IEnumerable<ServerObject> GetObjects(IDbConnection cn)
+        private IEnumerable<ServerObject> GetObjects(IDbConnection cn, DateTime last)
         {
-            return cn.Query<ServerObject>(getObjectsSql);
+            return cn.Query<ServerObject>(getObjectsSql, new { last = last });
         }
 
         private string GetDdl(IDbConnection cn, ServerObject obj)
         {
-            DynamicParameters param = new();
-            param.Add("ddl_code", "", direction: ParameterDirection.Output);
+            OracleDynamicParameters param = new();
+            param.Add("ddl_code", null, direction: ParameterDirection.Output, dbType: OracleMappingType.Clob);
             param.AddDynamicParams(obj);
-
+            
             cn.Execute(Form1.getDdlSql, param);
 
-            return param.Get<string>("ddl_code");
+            var ddl = param.GetParameter("ddl_code").AttachedParam.Value as OracleClob;
+            return ddl?.Value;
         }
 
         private class ServerObject
@@ -207,7 +261,7 @@ end;
 
         private void button2_Click(object sender, EventArgs e)
         {
-            LoadDdl();
+            LoadDdl(GetLastAutocommitDate());
         }
 
         private void button3_Click(object sender, EventArgs e)
